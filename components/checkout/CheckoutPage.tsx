@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import BackgroundSlash from "./BackgroundSlash";
 import CurrencySelector, { Currency } from "./CurrencySelector";
 import AmountInput from "./AmountInput";
@@ -16,49 +16,93 @@ const CURRENCY_SYMBOLS: Record<Currency, string> = {
   USD: "$",
 };
 
+const TERMINAL = new Set(["successful", "failed", "cancelled"]);
+
+function loadLencoScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (typeof document === "undefined") { resolve(); return; }
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload  = () => resolve();
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function waitForLencoPay(timeout = 3000): Promise<any | null> {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeout;
+    function check() {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lp = (window as any).LencoPay;
+      if (lp && typeof lp.getPaid === "function") { resolve(lp); return; }
+      Date.now() < deadline ? setTimeout(check, 100) : resolve(null);
+    }
+    check();
+  });
+}
+
 export default function CheckoutPage() {
-  const [currency, setCurrency] = useState<Currency>("ZMW");
-  const [amount, setAmount] = useState("");
-  const [method, setMethod] = useState<PaymentMethod>("mobile_money");
-  const [operator, setOperator] = useState<Operator>("airtel");
-  const [phoneNumber, setPhoneNumber] = useState("");
-  const [customerName, setCustomerName] = useState("");
+  const [currency,      setCurrency]      = useState<Currency>("ZMW");
+  const [amount,        setAmount]        = useState("");
+  const [method,        setMethod]        = useState<PaymentMethod>("mobile_money");
+  const [operator,      setOperator]      = useState<Operator>("airtel");
+  const [phoneNumber,   setPhoneNumber]   = useState("");
+  const [customerName,  setCustomerName]  = useState("");
   const [customerEmail, setCustomerEmail] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [loading,       setLoading]       = useState(false);
+  const [error,         setError]         = useState("");
   const [paymentStatus, setPaymentStatus] = useState<"idle" | "processing" | "success" | "failed">("idle");
-  const [paymentRef, setPaymentRef] = useState("");
+  const [paymentRef,    setPaymentRef]    = useState("");
   const [statusMessage, setStatusMessage] = useState("");
+  const [syncMode,      setSyncMode]      = useState<"sse" | "polling" | "idle">("idle");
 
+  const esRef       = useRef<EventSource | null>(null);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const doneRef     = useRef(false);
+
+  /* ── Real-time status sync (SSE-first → polling fallback) ── */
   useEffect(() => {
-    let intervalId: NodeJS.Timeout;
+    if (paymentStatus !== "processing" || !paymentRef) return;
 
-    if (paymentStatus === "processing" && paymentRef) {
+    doneRef.current = false;
+
+    function handleTerminal(status: string, reason?: string) {
+      if (doneRef.current) return;
+      doneRef.current = true;
+      if (esRef.current)       { esRef.current.close(); esRef.current = null; }
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+      if (status === "successful") {
+        setPaymentStatus("success");
+        setStatusMessage("Payment received successfully!");
+      } else {
+        setPaymentStatus("failed");
+        setStatusMessage(reason || "Payment failed or was cancelled.");
+      }
+    }
+
+    /* ── Polling fallback ── */
+    function startPolling() {
+      setSyncMode("polling");
       const startTime = Date.now();
-      const MAX_POLLING_TIME = 2 * 60 * 1000; // 2 minutes timeout
+      const MAX_MS    = 2 * 60 * 1000;
 
-      intervalId = setInterval(async () => {
+      intervalRef.current = setInterval(async () => {
+        if (doneRef.current) { clearInterval(intervalRef.current!); return; }
+        if (Date.now() - startTime > MAX_MS) {
+          handleTerminal("failed", "Payment session expired. Please check your signal and try again.");
+          return;
+        }
         try {
-          if (Date.now() - startTime > MAX_POLLING_TIME) {
-            setPaymentStatus("failed");
-            setStatusMessage("Payment session expired. Please check your signal and try again.");
-            clearInterval(intervalId);
-            return;
-          }
-
-          const res = await fetch(`/api/status/${paymentRef}`);
+          const res  = await fetch(`/api/status/${paymentRef}`);
           const data = await res.json();
           if (data.status === true && data.data) {
-            const status = data.data.status;
-            if (status === "successful") {
-              setPaymentStatus("success");
-              setStatusMessage("Payment received successfully!");
-              clearInterval(intervalId);
-            } else if (status === "failed" || status === "cancelled" || status === "pay-offline") {
-              setPaymentStatus("failed");
-              setStatusMessage(data.data.reasonForFailure || "Payment failed or was cancelled.");
-              clearInterval(intervalId);
-            }
+            const st = (data.data.status ?? "") as string;
+            if (st === "successful") handleTerminal("successful");
+            else if (TERMINAL.has(st)) handleTerminal("failed", data.data.reasonForFailure);
           }
         } catch (err) {
           console.error("Polling error", err);
@@ -66,7 +110,45 @@ export default function CheckoutPage() {
       }, 3000);
     }
 
-    return () => clearInterval(intervalId);
+    /* ── SSE (primary) ── */
+    if (typeof window !== "undefined" && "EventSource" in window) {
+      setSyncMode("sse");
+      const es = new EventSource(`/api/status/${paymentRef}/stream`);
+      esRef.current = es;
+
+      // If no real event in 8 s, switch to polling
+      const sseTimeout = setTimeout(() => {
+        es.close();
+        if (!doneRef.current) startPolling();
+      }, 8000);
+
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data) as {
+            status: string;
+            reasonForFailure?: string;
+          };
+          if (payload.status === "connected") return;
+          clearTimeout(sseTimeout);
+          if (payload.status === "successful") handleTerminal("successful");
+          else if (TERMINAL.has(payload.status)) handleTerminal("failed", payload.reasonForFailure);
+        } catch { /* ignore malformed */ }
+      };
+
+      es.onerror = () => {
+        clearTimeout(sseTimeout);
+        es.close();
+        esRef.current = null;
+        if (!doneRef.current) startPolling();
+      };
+    } else {
+      startPolling();
+    }
+
+    return () => {
+      if (esRef.current)       { esRef.current.close(); esRef.current = null; }
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+    };
   }, [paymentStatus, paymentRef]);
 
   const handleSubmit = async (e?: React.FormEvent) => {
@@ -113,11 +195,48 @@ export default function CheckoutPage() {
         setPaymentRef(data.reference);
         setPaymentStatus("processing");
       } else if (method === "card") {
-        if (typeof window !== "undefined" && (window as any).LencoPay) {
-          (window as any).LencoPay.getPaid(data.widgetConfig);
-        } else {
-          setError("Lenco payment widget is not loaded.");
+        try {
+          await loadLencoScript("https://pay.lenco.co/js/v1/inline.js");
+        } catch {
+          setError("Could not load checkout script. Check your connection.");
+          return;
         }
+
+        const lp = await waitForLencoPay();
+        if (!lp) {
+          setError("Card checkout widget failed to initialise. Refresh and try again.");
+          return;
+        }
+
+        const cfg = data.widgetConfig;
+        if (!cfg) {
+          setError("Card configuration was not received from the server.");
+          return;
+        }
+
+        const parts = (customerName || "").trim().split(/\s+/);
+        lp.getPaid({
+          key: cfg.publicKey,
+          amount: Number(cfg.amount),
+          currency: cfg.currency,
+          reference: cfg.reference,
+          email: cfg.customerEmail,
+          label: cfg.description,
+          bearer: cfg.bearer || "merchant",
+          customer: {
+            firstName: parts[0] || "",
+            lastName: parts.slice(1).join(" ") || "",
+          },
+          onSuccess: (r: { reference: string }) => {
+            setPaymentRef(r.reference || cfg.reference);
+            setPaymentStatus("success");
+            setStatusMessage("Payment received successfully!");
+          },
+          onClose: () => {
+            setLoading(false);
+          },
+        });
+        return;
       }
     } catch (err) {
       setError("An unexpected network error occurred.");
@@ -229,13 +348,29 @@ export default function CheckoutPage() {
               <div className="flex flex-col items-center justify-center h-full min-h-[400px] text-center sp-fade-in">
                 {paymentStatus === "processing" && (
                   <>
-                    <div className="w-16 h-16 rounded-full border-4 border-primary/20 border-t-primary animate-spin mb-6"></div>
+                    <div className="relative w-16 h-16 mb-6">
+                      <div className="absolute inset-0 rounded-full border-4 border-primary/20 border-t-primary animate-spin" />
+                    </div>
                     <h2 className="text-xl font-medium text-on-surface mb-2">Awaiting Payment</h2>
-                    <p className="text-sm text-on-surface-variant max-w-[280px]">
+                    <p className="text-sm text-on-surface-variant max-w-[280px] mb-4">
                       Please check your mobile phone for an authorization prompt to complete the payment.
                     </p>
+                    {/* Sync mode badge */}
+                    <span className={[
+                      "inline-flex items-center gap-1.5 text-[11px] font-semibold px-3 py-1 rounded-full border",
+                      syncMode === "sse"
+                        ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                        : "bg-amber-50 text-amber-700 border-amber-200",
+                    ].join(" ")}>
+                      <span className={[
+                        "w-1.5 h-1.5 rounded-full animate-pulse",
+                        syncMode === "sse" ? "bg-emerald-500" : "bg-amber-400",
+                      ].join(" ")} />
+                      {syncMode === "sse" ? "Live stream active" : "Polling for status…"}
+                    </span>
                   </>
                 )}
+
                 {paymentStatus === "success" && (
                   <>
                     <div className="w-16 h-16 rounded-full bg-green-50 text-green-500 flex items-center justify-center mb-6">

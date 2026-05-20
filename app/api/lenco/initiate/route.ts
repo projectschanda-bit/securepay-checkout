@@ -3,6 +3,8 @@ import {
   initiateMobileMoneyPayment,
   buildCardWidgetConfig,
   generateReference,
+  deriveCountry,
+  formatPhoneNumber,
   type Currency,
   type MobileOperator,
   type FeeBearer,
@@ -50,21 +52,21 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // Normalise Zambian numbers to local format (09xxxxxxxx or 07xxxxxxxx)
-      let phone = phoneNumber.replace(/\s+/g, "");
-      if (phone.startsWith("+260"))       phone = "0" + phone.slice(4);
-      else if (phone.startsWith("260") && phone.length === 12) phone = "0" + phone.slice(3);
+      // Derive country and format phone number using the SDK
+      const country = deriveCountry(currency as Currency, phoneNumber);
+      const formattedPhone = formatPhoneNumber(phoneNumber, country);
 
       const result = await initiateMobileMoneyPayment({
         amount:        finalAmount,
         currency:      currency as Currency,
         reference,
-        phoneNumber:   phone,
+        phoneNumber:   formattedPhone,
         operator:      operator as MobileOperator,
         bearer:        (bearer ?? "merchant") as FeeBearer,
         customerName,
         customerEmail,
         description,
+        country,
       });
 
       return NextResponse.json({ ...result, reference });

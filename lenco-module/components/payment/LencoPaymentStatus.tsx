@@ -31,31 +31,35 @@ const STATUS_CONFIG: Record<string, {
   color: string; bg: string; border: string; glow: string;
 }> = {
   successful: { icon: "check_circle", label: "Payment Successful", color: "#16a34a", bg: "#f0fdf4", border: "#86efac", glow: "rgba(22,163,74,0.18)" },
-  failed: { icon: "cancel", label: "Payment Failed", color: "#dc2626", bg: "#fef2f2", border: "#fca5a5", glow: "rgba(220,38,38,0.15)" },
-  pending: { icon: "schedule", label: "Processing Payment", color: "#d97706", bg: "#fffbeb", border: "#fcd34d", glow: "rgba(217,119,6,0.15)" },
-  processing: { icon: "autorenew", label: "Verifying Payment", color: "#4f46e5", bg: "#eef2ff", border: "#a5b4fc", glow: "rgba(79,70,229,0.15)" },
+  failed:     { icon: "cancel",       label: "Payment Failed",     color: "#dc2626", bg: "#fef2f2", border: "#fca5a5", glow: "rgba(220,38,38,0.15)" },
+  cancelled:  { icon: "cancel",       label: "Payment Cancelled",  color: "#dc2626", bg: "#fef2f2", border: "#fca5a5", glow: "rgba(220,38,38,0.15)" },
+  pending:    { icon: "schedule",     label: "Processing Payment", color: "#d97706", bg: "#fffbeb", border: "#fcd34d", glow: "rgba(217,119,6,0.15)" },
+  processing: { icon: "autorenew",   label: "Verifying Payment",  color: "#4f46e5", bg: "#eef2ff", border: "#a5b4fc", glow: "rgba(79,70,229,0.15)" },
 };
 
 /* ─────────────────────────────────────────────────
-   Adaptive poll schedule (ms between each attempt)
+   Adaptive poll schedule — used only as SSE fallback
    Fast at first, backs off gently if still pending
 ───────────────────────────────────────────────── */
 const POLL_SCHEDULE = [800, 1200, 1500, 1800, 2000, 2500, 2500, 3000, 3000, 3000];
 const MAX_POLLS = 24;
+const TERMINAL = new Set(["successful", "failed", "cancelled"]);
 
 /* ─────────────────────────────────────────────────
    Component
 ───────────────────────────────────────────────── */
 export function LencoPaymentStatus({ reference, onRestart }: LencoPaymentStatusProps) {
-  const [data, setData] = useState<StatusData | null>(null);
-  const [polls, setPolls] = useState(0);
+  const [data, setData]       = useState<StatusData | null>(null);
+  const [polls, setPolls]     = useState(0);
   const [elapsed, setElapsed] = useState(0);
-  const [entered, setEntered] = useState(false);   // controls entrance animation
+  const [entered, setEntered] = useState(false);
+  const [syncMode, setSyncMode] = useState<"sse" | "polling" | "idle">("idle");
 
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const pollCountRef = useRef(0);
-  const doneRef = useRef(false);
+  const timerRef       = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const elapsedRef     = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollCountRef   = useRef(0);
+  const doneRef        = useRef(false);
+  const esRef          = useRef<EventSource | null>(null);
 
   /* ── Elapsed ticker ── */
   useEffect(() => {
@@ -71,47 +75,123 @@ export function LencoPaymentStatus({ reference, onRestart }: LencoPaymentStatusP
     }
   }, [data, entered]);
 
-  /* ── Polling loop ── */
+  /* ── SSE + Polling loop ── */
   useEffect(() => {
     if (!reference) return;
 
-    async function poll() {
-      try {
-        const res = await fetch(`/api/status/${reference}`, { cache: "no-store" });
-        const json: StatusData = await res.json();
-        setData(json);
+    /* ────────── Adaptive polling fallback ────────── */
+    function startPolling() {
+      setSyncMode("polling");
 
-        const st = json.data?.status?.toLowerCase() ?? "";
-        const done = st === "successful" || st === "failed";
+      async function poll() {
+        if (doneRef.current) return;
+        try {
+          const res  = await fetch(`/api/status/${reference}`, { cache: "no-store" });
+          const json: StatusData = await res.json();
+          setData(json);
 
-        if (done) {
-          doneRef.current = true;
-          if (elapsedRef.current) clearInterval(elapsedRef.current);
-          return;
-        }
+          const st   = json.data?.status?.toLowerCase() ?? "";
+          if (TERMINAL.has(st)) {
+            doneRef.current = true;
+            if (elapsedRef.current) clearInterval(elapsedRef.current);
+            return;
+          }
 
-        // Still pending — schedule next poll using adaptive interval
-        if (pollCountRef.current < MAX_POLLS) {
-          const delay = POLL_SCHEDULE[Math.min(pollCountRef.current, POLL_SCHEDULE.length - 1)];
-          pollCountRef.current += 1;
-          setPolls(pollCountRef.current);
-          timerRef.current = setTimeout(poll, delay);
-        }
-      } catch {
-        // Keep polling on network hiccup
-        if (pollCountRef.current < MAX_POLLS && !doneRef.current) {
-          const delay = POLL_SCHEDULE[Math.min(pollCountRef.current, POLL_SCHEDULE.length - 1)];
-          pollCountRef.current += 1;
-          setPolls(pollCountRef.current);
-          timerRef.current = setTimeout(poll, delay);
-        } else {
-          setData({ status: false, message: "Could not reach the payment server." });
+          if (pollCountRef.current < MAX_POLLS) {
+            const delay = POLL_SCHEDULE[Math.min(pollCountRef.current, POLL_SCHEDULE.length - 1)];
+            pollCountRef.current += 1;
+            setPolls(pollCountRef.current);
+            timerRef.current = setTimeout(poll, delay);
+          }
+        } catch {
+          if (pollCountRef.current < MAX_POLLS && !doneRef.current) {
+            const delay = POLL_SCHEDULE[Math.min(pollCountRef.current, POLL_SCHEDULE.length - 1)];
+            pollCountRef.current += 1;
+            setPolls(pollCountRef.current);
+            timerRef.current = setTimeout(poll, delay);
+          } else if (!doneRef.current) {
+            setData({ status: false, message: "Could not reach the payment server." });
+          }
         }
       }
+
+      poll();
     }
 
-    poll();
-    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+    /* ────────── SSE (primary path) ────────── */
+    function startSSE() {
+      if (!("EventSource" in window)) {
+        // Browser doesn't support SSE — fall back immediately
+        startPolling();
+        return;
+      }
+
+      setSyncMode("sse");
+
+      const es = new EventSource(`/api/status/${reference}/stream`);
+      esRef.current = es;
+
+      // Timeout: if we don't get a real status event in 8 s, switch to polling
+      const sseTimeout = setTimeout(() => {
+        es.close();
+        if (!doneRef.current) startPolling();
+      }, 8000);
+
+      es.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as {
+            reference: string;
+            status: string;
+            amount?: number;
+            currency?: string;
+            customerName?: string;
+          };
+
+          // Ignore the initial heartbeat "connected" event
+          if (payload.status === "connected") return;
+
+          // Clear the fallback timeout — SSE is alive and delivering data
+          clearTimeout(sseTimeout);
+
+          // Map SSE event into the same StatusData shape the UI expects
+          setData({
+            status: true,
+            data: {
+              status:       payload.status,
+              amount:       payload.amount,
+              currency:     payload.currency,
+              reference:    payload.reference,
+              customerName: payload.customerName,
+            },
+          });
+
+          if (TERMINAL.has(payload.status.toLowerCase())) {
+            doneRef.current = true;
+            if (elapsedRef.current) clearInterval(elapsedRef.current);
+            es.close();
+          }
+        } catch {
+          // Malformed SSE event — ignore
+        }
+      };
+
+      es.onerror = () => {
+        clearTimeout(sseTimeout);
+        es.close();
+        esRef.current = null;
+        // SSE connection dropped — activate polling fallback
+        if (!doneRef.current) startPolling();
+      };
+    }
+
+    // Kick-off: try SSE first
+    startSSE();
+
+    return () => {
+      // Cleanup
+      if (timerRef.current)   clearTimeout(timerRef.current);
+      if (esRef.current)      { esRef.current.close(); esRef.current = null; }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reference]);
 
@@ -158,6 +238,19 @@ export function LencoPaymentStatus({ reference, onRestart }: LencoPaymentStatusP
             Checking payment status&nbsp;&middot;&nbsp;
             <span className="font-mono font-medium">{elapsed}s</span>
           </p>
+          {/* Sync mode badge */}
+          <span className={[
+            "mt-1 inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full",
+            syncMode === "sse"
+              ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+              : "bg-amber-50 text-amber-700 border border-amber-200",
+          ].join(" ")}>
+            <span className={[
+              "w-1.5 h-1.5 rounded-full",
+              syncMode === "sse" ? "bg-emerald-500" : "bg-amber-400",
+            ].join(" ")} />
+            {syncMode === "sse" ? "Live stream" : "Polling"}
+          </span>
         </div>
 
         {/* ── Bouncing dots ── */}
@@ -186,9 +279,9 @@ export function LencoPaymentStatus({ reference, onRestart }: LencoPaymentStatusP
      RESULT STATE
   ───────────────────────────────────────────── */
   const txStatus = data?.data?.status?.toLowerCase() ?? "pending";
-  const cfg = STATUS_CONFIG[txStatus] ?? STATUS_CONFIG.pending;
+  const cfg      = STATUS_CONFIG[txStatus] ?? STATUS_CONFIG.pending;
   const isSuccess = txStatus === "successful";
-  const isFailed = txStatus === "failed";
+  const isFailed  = txStatus === "failed" || txStatus === "cancelled";
   const isPending = !isSuccess && !isFailed;
 
   return (
@@ -210,9 +303,9 @@ export function LencoPaymentStatus({ reference, onRestart }: LencoPaymentStatusP
         <div
           className="relative w-24 h-24 rounded-full flex items-center justify-center"
           style={{
-            background: `${cfg.color}18`,
-            border: `2px solid ${cfg.border}`,
-            boxShadow: `0 0 40px ${cfg.glow}, 0 0 0 8px ${cfg.color}08`,
+            background:  `${cfg.color}18`,
+            border:      `2px solid ${cfg.border}`,
+            boxShadow:   `0 0 40px ${cfg.glow}, 0 0 0 8px ${cfg.color}08`,
           }}>
           {/* Ping ring for success */}
           {isSuccess && (
@@ -225,7 +318,7 @@ export function LencoPaymentStatus({ reference, onRestart }: LencoPaymentStatusP
             className="material-symbols-outlined relative z-10"
             style={{
               fontSize: 46,
-              color: cfg.color,
+              color:    cfg.color,
               fontVariationSettings: "'FILL' 1",
               animation: isSuccess
                 ? "icon-bounce-in 0.55s cubic-bezier(0.34,1.56,0.64,1)"
@@ -271,7 +364,10 @@ export function LencoPaymentStatus({ reference, onRestart }: LencoPaymentStatusP
             <div>
               <p className="text-body-sm font-semibold text-amber-800">Still processing…</p>
               <p className="text-[11px] text-amber-600 mt-0.5">
-                Attempt {polls} of {MAX_POLLS}&nbsp;&middot;&nbsp;{elapsed}s elapsed
+                {syncMode === "sse"
+                  ? "Listening for live update"
+                  : `Attempt ${polls} of ${MAX_POLLS}`}
+                &nbsp;&middot;&nbsp;{elapsed}s elapsed
               </p>
             </div>
           </div>

@@ -58,7 +58,7 @@ export function LencoPaymentForm({
 
     setLoading(true);
     try {
-      const res  = await fetch("/api/initiate", {
+      const res  = await fetch("/api/lenco/initiate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ method, amount, currency, phoneNumber, operator, bearer: "merchant", customerName, customerEmail }),
